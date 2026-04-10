@@ -25,10 +25,42 @@ import csv
 import io
 import sys
 import os
+import time
+import tempfile
 from datetime import date, datetime
 from flask import Flask, Response, jsonify, request
 from faster_whisper import WhisperModel
 from pynput import keyboard
+
+try:
+    import anthropic as _anthropic_lib
+    _ANTHROPIC = True
+except ImportError:
+    _ANTHROPIC = False
+
+try:
+    import soundfile as _sf
+    _SOUNDFILE = True
+except ImportError:
+    _SOUNDFILE = False
+
+try:
+    from PIL import Image as _PILImage
+    _PIL = True
+except ImportError:
+    _PIL = False
+
+try:
+    import requests as _requests
+    _REQUESTS = True
+except ImportError:
+    _REQUESTS = False
+
+try:
+    from pyannote.audio import Pipeline as _PyannotePipeline
+    _PYANNOTE_AVAILABLE = True
+except ImportError:
+    _PYANNOTE_AVAILABLE = False
 
 # AppKit (via pyobjc — bereits durch rumps installiert)
 try:
@@ -51,6 +83,25 @@ LANGUAGE    = "de"      # "de" | "en" | "auto"
 VAD_FILTER  = True      # Voice Activity Detection (Stille rausfiltern)
 PORT        = 5173
 DB_PATH     = os.path.expanduser("~/.whispr.db")
+
+# API Keys — als Umgebungsvariablen setzen oder hier direkt eintragen
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+HF_TOKEN          = os.environ.get("HF_TOKEN", "")        # HuggingFace für pyannote
+NOTION_TOKEN      = os.environ.get("NOTION_TOKEN", "")    # Notion Internal Integration Token
+
+# Notion: Parent-Page für alle Test-Reports (Testing & Feedback unter Product)
+NOTION_TESTING_PAGE_ID = "33ea32b52b49817ab561fc6d88dd991b"
+
+# Bekannte Call-Apps → Typ (external / internal)
+CALL_APPS = {
+    "zoom.us":           "external",
+    "Zoom":              "external",
+    "Google Chrome":     "external",   # Google Meet läuft im Browser
+    "Microsoft Teams":   "external",
+    "Webex":             "external",
+    "FaceTime":          "external",
+    "Slack":             "internal",
+}
 # ──────────────────────────────────────────────────────────
 
 # Hotkey für Aufnahme — rechte Option-Taste (fn funktioniert nicht auf neueren Macs)
@@ -87,6 +138,15 @@ def init_db():
             CREATE TABLE IF NOT EXISTS settings (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS meetings (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                app        TEXT,
+                call_type  TEXT,
+                transcript TEXT,
+                summary    TEXT,
+                duration   REAL DEFAULT 0,
+                created_at TEXT DEFAULT (datetime('now','localtime'))
             );
         """)
         conn.commit()
@@ -132,6 +192,462 @@ _last_level_t = 0.0    # Throttle für Level-Updates im Overlay
 
 # Overlay-Instanz (wird nach Klassen-Definition weiter unten erzeugt)
 overlay: "RecordingOverlay | None" = None
+
+# ─── Meeting State ────────────────────────────────────────
+meeting_active  = False
+meeting_frames  = []
+meeting_app     = ""
+meeting_type    = ""
+meeting_start   = None
+meeting_stream  = None
+meeting_lock    = threading.Lock()
+
+# ─── Call Detection ───────────────────────────────────────
+def get_active_call_app():
+    """Prüft ob eine bekannte Call-App läuft. Gibt (app_name, call_type) zurück."""
+    try:
+        r = subprocess.run(
+            ["osascript", "-e",
+             "tell application \"System Events\" to get name of every application process"],
+            capture_output=True, text=True, timeout=2
+        )
+        procs = r.stdout
+        for app, ctype in CALL_APPS.items():
+            if app in procs:
+                return app, ctype
+    except Exception:
+        pass
+    return None, None
+
+# ─── Meeting Recording ────────────────────────────────────
+def _meeting_audio_callback(indata, frames, time_info, status):
+    if meeting_active:
+        meeting_frames.append(indata.copy())
+
+def start_meeting_recording(app_name, call_type):
+    global meeting_active, meeting_frames, meeting_start, meeting_stream, meeting_app, meeting_type
+    with meeting_lock:
+        if meeting_active:
+            return
+        meeting_active = True
+        meeting_frames = []
+        meeting_start  = datetime.now()
+        meeting_app    = app_name
+        meeting_type   = call_type
+        meeting_stream = sd.InputStream(
+            samplerate=SAMPLE_RATE, channels=1, dtype="int16",
+            callback=_meeting_audio_callback, blocksize=1024
+        )
+        meeting_stream.start()
+
+def stop_and_process_meeting():
+    global meeting_active, meeting_stream
+    with meeting_lock:
+        meeting_active = False
+        frames  = list(meeting_frames)
+        t_start = meeting_start
+        app     = meeting_app
+        ctype   = meeting_type
+        if meeting_stream:
+            meeting_stream.stop()
+            meeting_stream.close()
+            meeting_stream = None
+
+    if not frames:
+        return
+
+    try:
+        duration    = (datetime.now() - t_start).total_seconds() if t_start else 0
+        audio_data  = np.concatenate(frames, axis=0).flatten()
+        audio_float = audio_data.astype(np.float32) / 32768.0
+
+        subprocess.Popen(["osascript", "-e",
+            'display notification "Transkribiere Meeting..." with title "whispr \u23f3"'])
+
+        transcript = _transcribe_with_speakers(audio_float)
+        summary    = _generate_meeting_summary(transcript, ctype, app)
+
+        with get_db() as conn:
+            conn.execute(
+                "INSERT INTO meetings (app, call_type, transcript, summary, duration) VALUES (?,?,?,?,?)",
+                (app, ctype, transcript, summary, round(duration, 1))
+            )
+            conn.commit()
+
+        preview  = (summary or "Meeting gespeichert.")[:80]
+        safe_pre = (preview
+                    .replace('"', '\\"').replace("'", "\\'")
+                    .replace("\u201c", '\\"').replace("\u201d", '\\"')
+                    .replace("\u201e", '\\"').replace("\u2018", "\\'")
+                    .replace("\u2019", "\\'"))
+        subprocess.Popen(["osascript", "-e",
+            f'display notification "{safe_pre}" with title "whispr \u2705 Meeting Summary"'])
+
+    except Exception as e:
+        subprocess.Popen(["osascript", "-e",
+            f'display notification "Fehler: {str(e)[:80]}" with title "whispr \u26a0\ufe0f"'])
+
+# ─── Speaker Diarization ──────────────────────────────────
+_pyannote_pipeline = None
+
+def _load_pyannote():
+    global _pyannote_pipeline
+    if _pyannote_pipeline is not None:
+        return _pyannote_pipeline
+    if not HF_TOKEN or not _PYANNOTE_AVAILABLE:
+        return None
+    try:
+        _pyannote_pipeline = _PyannotePipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1",
+            use_auth_token=HF_TOKEN
+        )
+        print("[pyannote] Pipeline geladen ✅")
+        return _pyannote_pipeline
+    except Exception as e:
+        print(f"[pyannote] Nicht verfügbar: {e}")
+        return None
+
+def _fmt_time(seconds):
+    m, s = divmod(int(seconds), 60)
+    return f"{m:02d}:{s:02d}"
+
+def _transcribe_with_speakers(audio_float):
+    """Transkribiert Audio. Mit pyannote: Speaker-Labels. Ohne: einfacher Text."""
+    lang_param = None if LANGUAGE == "auto" else LANGUAGE
+    segments, _ = model.transcribe(
+        audio_float, language=lang_param, beam_size=5,
+        vad_filter=VAD_FILTER, word_timestamps=False
+    )
+    segs = list(segments)
+
+    pipeline = _load_pyannote()
+    if pipeline is None or not _SOUNDFILE:
+        # Kein Diarization — einfaches Transkript zurückgeben
+        return "\n".join(f"[{_fmt_time(s.start)}] {s.text.strip()}" for s in segs)
+
+    # Audio als .wav speichern für pyannote
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            tmp_path = f.name
+        _sf.write(tmp_path, audio_float, SAMPLE_RATE)
+        diarization = pipeline(tmp_path)
+
+        lines = []
+        for seg in segs:
+            seg_mid = (seg.start + seg.end) / 2
+            speaker = "?"
+            for turn, _, spk in diarization.itertracks(yield_label=True):
+                if turn.start <= seg_mid <= turn.end:
+                    speaker = spk.replace("SPEAKER_", "Sprecher ")
+                    break
+            lines.append(f"[{speaker} – {_fmt_time(seg.start)}] {seg.text.strip()}")
+        return "\n".join(lines)
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+# ─── Testing Mode ────────────────────────────────────────
+test_active              = False
+test_session_name        = ""
+test_start_time          = None
+test_screenshots         = []   # list of {path, url, timestamp, notes:[]}
+test_last_path           = None
+test_lock                = threading.Lock()
+_test_thread             = None
+
+def _test_dir_for_session(name):
+    safe = "".join(c if c.isalnum() or c in " -_" else "_" for c in name)
+    ts   = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    path = os.path.expanduser(f"~/.whispr-tests/{ts}_{safe}")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+def get_chrome_url() -> str:
+    """Aktuelle URL aus Google Chrome holen."""
+    try:
+        r = subprocess.run(
+            ["osascript", "-e",
+             'tell application "Google Chrome" to return URL of active tab of front window'],
+            capture_output=True, text=True, timeout=2
+        )
+        return r.stdout.strip()
+    except Exception:
+        return ""
+
+def _take_screenshot(path: str) -> bool:
+    """Macht einen Screenshot des gesamten Bildschirms."""
+    try:
+        subprocess.run(["screencapture", "-x", "-o", path],
+                       capture_output=True, check=True, timeout=5)
+        return os.path.exists(path)
+    except Exception:
+        return False
+
+def _images_differ(path1: str, path2: str, threshold: float = 0.025) -> bool:
+    """True wenn sich die Bilder um mehr als threshold unterscheiden."""
+    if not _PIL:
+        return True   # ohne Pillow: immer speichern
+    try:
+        img1 = np.array(_PILImage.open(path1).convert("RGB").resize((320, 200)))
+        img2 = np.array(_PILImage.open(path2).convert("RGB").resize((320, 200)))
+        diff = np.mean(np.abs(img1.astype(float) - img2.astype(float))) / 255.0
+        return diff > threshold
+    except Exception:
+        return True
+
+def _test_screenshot_loop(session_dir: str):
+    """Background-Thread: Screenshot alle 1.5s, speichern wenn Screen sich ändert."""
+    global test_last_path
+    idx = 0
+    while test_active:
+        try:
+            tmp = os.path.join(session_dir, f"_tmp.png")
+            if _take_screenshot(tmp):
+                if test_last_path is None or _images_differ(test_last_path, tmp):
+                    url        = get_chrome_url()
+                    final_path = os.path.join(session_dir, f"{idx:03d}_{datetime.now().strftime('%H%M%S')}.png")
+                    os.rename(tmp, final_path)
+                    with test_lock:
+                        test_screenshots.append({
+                            "path":      final_path,
+                            "url":       url,
+                            "timestamp": datetime.now().isoformat(),
+                            "notes":     []
+                        })
+                    test_last_path = final_path
+                    idx += 1
+                else:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+        except Exception:
+            pass
+        time.sleep(1.5)
+
+def start_test_session(name: str):
+    global test_active, test_session_name, test_start_time, test_screenshots, test_last_path, _test_thread
+    session_dir           = _test_dir_for_session(name)
+    test_active           = True
+    test_session_name     = name
+    test_start_time       = datetime.now()
+    test_screenshots      = []
+    test_last_path        = None
+    _test_thread = threading.Thread(target=_test_screenshot_loop, args=(session_dir,), daemon=True)
+    _test_thread.start()
+
+def stop_test_session(app_ref=None):
+    global test_active
+    test_active = False
+    if _test_thread:
+        _test_thread.join(timeout=3)
+
+    with test_lock:
+        shots    = list(test_screenshots)
+        name     = test_session_name
+        t_start  = test_start_time
+
+    duration = (datetime.now() - t_start).total_seconds() if t_start else 0
+
+    subprocess.Popen(["osascript", "-e",
+        'display notification "Erstelle Notion-Report..." with title "whispr \U0001f9ea"'])
+
+    threading.Thread(
+        target=_process_and_export_test,
+        args=(name, shots, duration),
+        daemon=True
+    ).start()
+
+def _analyse_screenshot_with_claude(img_path: str, notes: list) -> str:
+    """Schickt Screenshot + Notizen an Claude Vision → Beschreibung + Änderungsliste."""
+    if not ANTHROPIC_API_KEY or not _ANTHROPIC or not os.path.exists(img_path):
+        return "\n".join(notes) if notes else "(kein Kommentar)"
+    try:
+        import base64
+        with open(img_path, "rb") as f:
+            img_b64 = base64.standard_b64encode(f.read()).decode()
+
+        notes_txt = "\n".join(f"- {n}" for n in notes) if notes else "(keine Sprachnotizen)"
+        prompt = (
+            "Du analysierst einen Screenshot aus einem Produkt-Testing.\n\n"
+            f"Sprachnotizen der Testerin zu diesem Screen:\n{notes_txt}\n\n"
+            "Beschreibe in 1-2 Sätzen was auf dem Screen zu sehen ist (URL/Funktion). "
+            "Liste dann die konkreten Änderungswünsche aus den Notizen strukturiert auf. "
+            "Wenn keine Notizen: schreib 'Kein Feedback für diesen Screen.'\n"
+            "Antworte auf Deutsch, kurz und actionable."
+        )
+        client = _anthropic_lib.Anthropic(api_key=ANTHROPIC_API_KEY)
+        msg = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=400,
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/png", "data": img_b64
+                }},
+                {"type": "text", "text": prompt}
+            ]}]
+        )
+        return msg.content[0].text
+    except Exception as e:
+        return f"(Vision-Analyse fehlgeschlagen: {e})\n" + "\n".join(notes)
+
+def _process_and_export_test(name: str, shots: list, duration: float):
+    """Analysiert alle Screenshots + Notizen → Notion-Page erstellen."""
+    try:
+        # Nur Screenshots mit Notizen ODER jeden 5. (für Kontext) analysieren
+        analysed = []
+        for i, s in enumerate(shots):
+            has_notes = bool(s["notes"])
+            if has_notes or i % 5 == 0:
+                analysis = _analyse_screenshot_with_claude(s["path"], s["notes"])
+                analysed.append({**s, "analysis": analysis, "has_notes": has_notes})
+
+        notion_url = _create_notion_test_report(name, analysed, duration, len(shots))
+
+        if notion_url:
+            n_fb = len([x for x in analysed if x["has_notes"]])
+            subprocess.Popen(["osascript", "-e",
+                f'display notification "Notion-Report fertig \u2014 {n_fb} Screens mit Feedback" '
+                f'with title "whispr \u2705 Test abgeschlossen"'])
+        else:
+            subprocess.Popen(["osascript", "-e",
+                'display notification "Report lokal gespeichert (Notion-Token fehlt?)" '
+                'with title "whispr \u26a0\ufe0f Test abgeschlossen"'])
+    except Exception as e:
+        subprocess.Popen(["osascript", "-e",
+            f'display notification "Fehler: {str(e)[:80]}" with title "whispr \u26a0\ufe0f"'])
+
+def _create_notion_test_report(name: str, shots: list, duration: float, total_screens: int):
+    """Erstellt eine Notion-Page unter Testing & Feedback."""
+    if not NOTION_TOKEN or not _REQUESTS:
+        return None
+
+    headers = {
+        "Authorization":  f"Bearer {NOTION_TOKEN}",
+        "Content-Type":   "application/json",
+        "Notion-Version": "2022-06-28",
+    }
+
+    dur_min    = int(duration // 60)
+    dur_sec    = int(duration % 60)
+    date_str   = datetime.now().strftime("%d.%m.%Y %H:%M")
+    n_feedback = len([s for s in shots if s.get("has_notes")])
+
+    # Blocks bauen
+    blocks = []
+
+    # Header-Info
+    blocks.append({"object": "block", "type": "callout", "callout": {
+        "icon": {"type": "emoji", "emoji": "\U0001f9ea"},
+        "color": "blue_background",
+        "rich_text": [{"type": "text", "text": {"content":
+            f"Session: {name}  |  {date_str}  |  Dauer: {dur_min}min {dur_sec}s  |  "
+            f"{total_screens} Screens  |  {n_feedback} mit Feedback"
+        }}]
+    }})
+
+    blocks.append({"object": "block", "type": "divider", "divider": {}})
+
+    # Screens mit Feedback zuerst
+    feedback_shots = [s for s in shots if s.get("has_notes")]
+    if feedback_shots:
+        blocks.append({"object": "block", "type": "heading_2", "heading_2": {
+            "rich_text": [{"type": "text", "text": {"content": "\U0001f534 Screens mit Feedback"}}]
+        }})
+        for s in feedback_shots:
+            url_txt = s.get("url", "") or "—"
+            ts      = s.get("timestamp", "")[:16].replace("T", " ")
+            blocks.append({"object": "block", "type": "heading_3", "heading_3": {
+                "rich_text": [{"type": "text", "text": {"content": f"\U0001f5bc\ufe0f {url_txt}"}}]
+            }})
+            blocks.append({"object": "block", "type": "paragraph", "paragraph": {
+                "rich_text": [{"type": "text", "text": {"content": f"\U0001f552 {ts}"},
+                               "annotations": {"color": "gray"}}]
+            }})
+            # Analyse (Claude Vision)
+            for line in (s.get("analysis") or "").split("\n"):
+                if line.strip():
+                    blocks.append({"object": "block", "type": "paragraph", "paragraph": {
+                        "rich_text": [{"type": "text", "text": {"content": line.strip()}}]
+                    }})
+            # Sprachnotizen
+            if s["notes"]:
+                blocks.append({"object": "block", "type": "callout", "callout": {
+                    "icon": {"type": "emoji", "emoji": "\U0001f3a4"},
+                    "color": "yellow_background",
+                    "rich_text": [{"type": "text", "text": {"content":
+                        "Sprachnotizen: " + " / ".join(s["notes"])
+                    }}]
+                }})
+            blocks.append({"object": "block", "type": "divider", "divider": {}})
+
+    # Alle anderen Screens
+    other_shots = [s for s in shots if not s.get("has_notes")]
+    if other_shots:
+        blocks.append({"object": "block", "type": "heading_2", "heading_2": {
+            "rich_text": [{"type": "text", "text": {"content": "\u2705 Screens ohne Feedback"}}]
+        }})
+        for s in other_shots:
+            url_txt = s.get("url", "") or "—"
+            ts      = s.get("timestamp", "")[:16].replace("T", " ")
+            blocks.append({"object": "block", "type": "bulleted_list_item",
+                           "bulleted_list_item": {"rich_text": [
+                               {"type": "text", "text": {"content": f"{url_txt}"},
+                                "annotations": {"code": True}},
+                               {"type": "text", "text": {"content": f"  {ts}"},
+                                "annotations": {"color": "gray"}}
+                           ]}})
+
+    # Seite erstellen
+    payload = {
+        "parent":     {"page_id": NOTION_TESTING_PAGE_ID},
+        "icon":       {"type": "emoji", "emoji": "\U0001f9ea"},
+        "properties": {"title": {"title": [{"type": "text", "text":
+            {"content": f"\U0001f9ea {name} — {date_str}"}
+        }]}},
+        "children": blocks[:100]   # Notion API: max 100 blocks per request
+    }
+
+    r = _requests.post("https://api.notion.com/v1/pages", headers=headers, json=payload, timeout=15)
+    if r.status_code == 200:
+        return r.json().get("url")
+    return None
+
+# ─── Meeting Summary (Claude API) ────────────────────────
+def _generate_meeting_summary(transcript, call_type, app):
+    if not ANTHROPIC_API_KEY or not _ANTHROPIC:
+        return transcript[:600] + ("…" if len(transcript) > 600 else "")
+
+    try:
+        client = _anthropic_lib.Anthropic(api_key=ANTHROPIC_API_KEY)
+        if call_type == "internal":
+            prompt = (
+                f"Hier ist das Transkript eines internen Team-Calls via {app}.\n\n"
+                f"Transkript:\n{transcript}\n\n"
+                "Erstelle eine strukturierte Zusammenfassung auf Deutsch:\n"
+                "- \U0001f4cb Kurzzusammenfassung (2-3 Sätze)\n"
+                "- \u2705 Beschlossene Maßnahmen (mit Verantwortlichen wenn erkennbar)\n"
+                "- \u2753 Offene Punkte / nächste Schritte\n\n"
+                "Kurz und actionable."
+            )
+        else:
+            prompt = (
+                f"Hier ist das Transkript eines externen Calls via {app}.\n\n"
+                f"Transkript:\n{transcript}\n\n"
+                "Erstelle eine strukturierte Zusammenfassung auf Deutsch:\n"
+                "- \U0001f4cb Kurzzusammenfassung (2-3 Sätze)\n"
+                "- \U0001f91d Wichtigste besprochene Punkte\n"
+                "- \u2705 Vereinbarte Maßnahmen / nächste Schritte\n"
+                "- \u26a0\ufe0f Wichtige offene Punkte\n\n"
+                "Kurz, professionell, actionable."
+            )
+        msg = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=600,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return msg.content[0].text
+    except Exception as e:
+        return f"[Summary-Fehler: {e}]\n\nTranskript:\n{transcript[:400]}…"
 
 def get_frontmost_app() -> str:
     """Gibt den Namen der aktiven App zurück (wo Text eingefügt wird)."""
@@ -212,6 +728,12 @@ def stop_and_transcribe(app_ref):
                     (text, word_count, wpm, duration)
                 )
                 conn.commit()
+
+            # Im Test-Modus: Sprachnotiz dem aktuellen Screenshot anhängen
+            if test_active:
+                with test_lock:
+                    if test_screenshots:
+                        test_screenshots[-1]["notes"].append(text)
 
             subprocess.run(["pbcopy"], input=text.encode("utf-8"))
             subprocess.run([
@@ -586,6 +1108,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="nav-item" onclick="nav('snippets')">
     <span class="nav-icon">✂️</span> Snippets
   </div>
+  <div class="nav-item" onclick="nav('meetings')">
+    <span class="nav-icon">📋</span> <span id="nav-meetings">Meetings</span>
+  </div>
   <div class="nav-item" onclick="nav('settings')">
     <span class="nav-icon">⚙️</span> <span id="nav-settings">Einstellungen</span>
   </div>
@@ -665,6 +1190,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <button class="btn" id="btn-snip-add" onclick="addSnippet()">Hinzufügen</button>
     </div>
     <div id="snippet-list"></div>
+  </div>
+
+  <!-- Meetings -->
+  <div class="page" id="page-meetings">
+    <h1>📋 Meetings</h1>
+    <div id="meeting-status-bar" style="display:none;background:#fef3c7;border:1px solid #f59e0b;border-radius:10px;padding:12px 16px;margin-bottom:20px;font-size:14px;"></div>
+    <div id="meeting-list"><div class="empty">Noch keine Meeting-Aufnahmen.</div></div>
+    <div id="meeting-detail" style="display:none;background:#fff;border:1px solid #e5e5ea;border-radius:14px;padding:24px;margin-top:16px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+        <h2 id="meeting-detail-title" style="margin:0"></h2>
+        <button class="btn-sm" onclick="closeMeetingDetail()">✕ Schließen</button>
+      </div>
+      <h3 style="font-size:14px;font-weight:600;margin-bottom:8px">📋 Summary</h3>
+      <div id="meeting-summary" style="font-size:14px;line-height:1.7;white-space:pre-wrap;margin-bottom:20px"></div>
+      <h3 style="font-size:14px;font-weight:600;margin-bottom:8px">📝 Transkript</h3>
+      <div id="meeting-transcript" style="font-size:12px;color:#6e6e73;line-height:1.7;white-space:pre-wrap;background:#f9f9fb;border-radius:8px;padding:12px"></div>
+    </div>
   </div>
 
   <!-- Settings -->
@@ -883,7 +1425,7 @@ async function checkLang() {
 }
 
 function nav(name) {
-  const pages = ['home','dictionary','snippets','settings'];
+  const pages = ['home','dictionary','snippets','meetings','settings'];
   document.querySelectorAll('.nav-item').forEach((el,i) => {
     el.classList.toggle('active', pages[i] === name);
   });
@@ -893,6 +1435,7 @@ function nav(name) {
   if (name === 'home')       loadHome();
   if (name === 'dictionary') loadDictionary();
   if (name === 'snippets')   loadSnippets();
+  if (name === 'meetings')   loadMeetings();
   if (name === 'settings')   loadSettings();
 }
 
@@ -1031,12 +1574,63 @@ async function clearHistory() {
   document.getElementById('stat-streak').textContent = '0';
 }
 
+// ── Meetings ─────────────────────────────────────────────
+async function loadMeetings() {
+  const meetings = await fetch('/api/meetings').then(r=>r.json());
+  const el = document.getElementById('meeting-list');
+  if (!meetings.length) { el.innerHTML='<div class="empty">Noch keine Meeting-Aufnahmen.</div>'; return; }
+  el.innerHTML = meetings.map(m => {
+    const dt    = new Date(m.created_at);
+    const time  = dt.toLocaleTimeString('de',{hour:'2-digit',minute:'2-digit'});
+    const day   = dt.toLocaleDateString('de',{day:'2-digit',month:'short'});
+    const icon  = m.call_type === 'internal' ? '👥' : '📞';
+    const label = m.call_type === 'internal' ? 'Team-Call' : 'Externer Call';
+    const dur   = m.duration ? Math.round(m.duration/60)+'min' : '';
+    const preview = (m.summary || '').slice(0,120).replace(/\n/g,' ');
+    return `<div class="history-item" style="cursor:pointer" onclick="openMeeting(${m.id})">
+      <div class="history-time">${time}<br><small>${day}</small></div>
+      <div style="flex:1">
+        <div style="font-size:13px;font-weight:600;margin-bottom:4px">${icon} ${label} · ${esc(m.app||'')} ${dur ? '· '+dur : ''}</div>
+        <div class="history-text">${esc(preview)}${preview.length>=120?'…':''}</div>
+      </div>
+    </div>`;
+  }).join('');
+
+  // Meeting status bar
+  const status = await fetch('/api/meetings/status').then(r=>r.json());
+  const bar = document.getElementById('meeting-status-bar');
+  if (status.active) {
+    const icon  = status.call_type === 'internal' ? '👥' : '📞';
+    bar.style.display = 'block';
+    bar.textContent   = icon + ' Aufnahme läuft — ' + (status.app||'') + '. Stoppe das Meeting über das Menü-Icon.';
+  } else {
+    bar.style.display = 'none';
+  }
+}
+
+async function openMeeting(id) {
+  const m = await fetch('/api/meetings/'+id).then(r=>r.json());
+  const icon  = m.call_type === 'internal' ? '👥' : '📞';
+  const label = m.call_type === 'internal' ? 'Team-Call' : 'Externer Call';
+  const dt    = new Date(m.created_at).toLocaleString('de');
+  document.getElementById('meeting-detail-title').textContent = icon+' '+label+' · '+dt;
+  document.getElementById('meeting-summary').textContent    = m.summary || '—';
+  document.getElementById('meeting-transcript').textContent = m.transcript || '—';
+  document.getElementById('meeting-detail').style.display   = 'block';
+  document.getElementById('meeting-detail').scrollIntoView({behavior:'smooth'});
+}
+
+function closeMeetingDetail() {
+  document.getElementById('meeting-detail').style.display = 'none';
+}
+
 let _pollInterval = null;
 function startPolling() {
   if (_pollInterval) return;
   _pollInterval = setInterval(async () => {
     await checkLang();
-    if (_page === 'home' && !document.hidden) loadHomeData();
+    if (_page === 'home'     && !document.hidden) loadHomeData();
+    if (_page === 'meetings' && !document.hidden) loadMeetings();
   }, 3000);
 }
 document.addEventListener('visibilitychange', () => {
@@ -1191,6 +1785,27 @@ def api_history_clear():
         conn.commit()
     return jsonify(ok=True)
 
+@flask_app.route("/api/meetings")
+def api_meetings():
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, app, call_type, summary, duration, created_at "
+            "FROM meetings ORDER BY created_at DESC LIMIT 30"
+        ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+@flask_app.route("/api/meetings/<int:mid>")
+def api_meeting_detail(mid):
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM meetings WHERE id=?", (mid,)).fetchone()
+    if not row:
+        return jsonify(error="not found"), 404
+    return jsonify(dict(row))
+
+@flask_app.route("/api/meetings/status")
+def api_meeting_status():
+    return jsonify(active=meeting_active, app=meeting_app, call_type=meeting_type)
+
 def run_flask():
     import logging
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
@@ -1200,6 +1815,9 @@ def run_flask():
 class WhisprApp(rumps.App):
     def __init__(self):
         super().__init__("🎙", quit_button=None)
+        self._call_detected_app  = None
+        self._call_detected_type = None
+        self._test_running       = False
         self._setup_menu()
         threading.Thread(target=run_flask, daemon=True).start()
         self._check_accessibility()
@@ -1208,6 +1826,9 @@ class WhisprApp(rumps.App):
         # Overlay-Tick auf dem Main-Thread (50 ms)
         self._overlay_timer = rumps.Timer(overlay.tick, 0.05)
         self._overlay_timer.start()
+        # Call-Detection alle 15 Sekunden
+        self._call_timer = rumps.Timer(self._check_for_calls, 15)
+        self._call_timer.start()
 
     def _check_accessibility(self):
         """Prüft ob Accessibility-Permission gesetzt ist — ohne sie funktioniert fn nicht."""
@@ -1223,20 +1844,36 @@ class WhisprApp(rumps.App):
 
     def _setup_menu(self):
         """Menü einmalig aufbauen — Items werden später nur per .title aktualisiert."""
-        self._item_dashboard = rumps.MenuItem("Dashboard öffnen",      callback=self.open_dashboard)
-        self._item_paste     = rumps.MenuItem("Letzten Text einfügen", callback=self.paste_last)
-        self._item_lang      = rumps.MenuItem("",                      callback=self.toggle_language)
-        self._item_mode      = rumps.MenuItem("",                      callback=self.toggle_mode_cb)
-        self._item_quit      = rumps.MenuItem("Beenden",               callback=self.quit_app)
+        self._item_dashboard     = rumps.MenuItem("Dashboard öffnen",      callback=self.open_dashboard)
+        self._item_paste         = rumps.MenuItem("Letzten Text einfügen", callback=self.paste_last)
+        self._item_lang          = rumps.MenuItem("",                      callback=self.toggle_language)
+        self._item_mode          = rumps.MenuItem("",                      callback=self.toggle_mode_cb)
+        self._item_meeting_start = rumps.MenuItem("",                      callback=self.start_meeting_cb)
+        self._item_meeting_stop  = rumps.MenuItem("",                      callback=self.stop_meeting_cb)
+        self._item_test_start    = rumps.MenuItem("🧪 Testing starten",   callback=self.start_test_cb)
+        self._item_test_stop     = rumps.MenuItem("",                      callback=self.stop_test_cb)
+        self._item_quit          = rumps.MenuItem("Beenden",               callback=self.quit_app)
+        self._item_meeting_start.set_callback(self.start_meeting_cb)
+        self._item_meeting_stop.set_callback(self.stop_meeting_cb)
+        self._item_test_stop.set_callback(self.stop_test_cb)
         self.menu = [
             self._item_dashboard,
             self._item_paste,
+            rumps.separator,
+            self._item_test_start,
+            self._item_test_stop,
+            rumps.separator,
+            self._item_meeting_start,
+            self._item_meeting_stop,
             rumps.separator,
             self._item_lang,
             self._item_mode,
             rumps.separator,
             self._item_quit,
         ]
+        self._item_meeting_start.title = ""
+        self._item_meeting_stop.title  = ""
+        self._item_test_stop.title     = ""
         self._refresh_labels()
 
     def _refresh_labels(self):
@@ -1268,10 +1905,75 @@ class WhisprApp(rumps.App):
         toggle_mode = not toggle_mode
         self._refresh_labels()
 
+    def _check_for_calls(self, _=None):
+        """Alle 15s: Prüfe ob ein Call läuft und zeige Menü-Item."""
+        app, ctype = get_active_call_app()
+        if app and not meeting_active and self._call_detected_app != app:
+            self._call_detected_app  = app
+            self._call_detected_type = ctype
+            icon  = "👥" if ctype == "internal" else "📞"
+            label = "Team-Call" if ctype == "internal" else "Externer Call"
+            self._item_meeting_start.title = f"{icon} {label} erkannt — Aufzeichnen starten"
+            self._item_meeting_stop.title  = ""
+            subprocess.Popen(["osascript", "-e",
+                f'display notification "Klick im Menü um Aufnahme zu starten" '
+                f'with title "whispr {icon} {label} erkannt ({app})"'])
+        elif not app and not meeting_active:
+            self._call_detected_app        = None
+            self._item_meeting_start.title = ""
+            self._item_meeting_stop.title  = ""
+
+    def start_meeting_cb(self, _):
+        if not self._call_detected_app:
+            return
+        start_meeting_recording(self._call_detected_app, self._call_detected_type)
+        label = "Team-Call" if self._call_detected_type == "internal" else "Externer Call"
+        self._item_meeting_start.title = ""
+        self._item_meeting_stop.title  = f"⏹ {label} stoppen & zusammenfassen"
+        subprocess.Popen(["osascript", "-e",
+            'display notification "Aufnahme läuft — stoppe sie über das Menü" '
+            'with title "whispr \U0001f534 Meeting läuft"'])
+
+    def stop_meeting_cb(self, _):
+        self._item_meeting_start.title = ""
+        self._item_meeting_stop.title  = ""
+        self._call_detected_app        = None
+        threading.Thread(target=stop_and_process_meeting, daemon=True).start()
+
+    def start_test_cb(self, _):
+        # Session-Name per Dialog abfragen
+        response = subprocess.run(
+            ["osascript", "-e",
+             'set n to text returned of (display dialog "Test-Session Name:" '
+             'default answer "GmbH Flow v1" buttons {"Abbrechen", "Starten"} '
+             'default button "Starten" with title "whispr 🧪 Testing")'],
+            capture_output=True, text=True
+        )
+        name = response.stdout.strip()
+        if not name or response.returncode != 0:
+            return
+        self._test_running           = True
+        self._item_test_start.title  = ""
+        self._item_test_stop.title   = f"⏹ Testing stoppen & Notion-Report → \"{name}\""
+        start_test_session(name)
+        subprocess.Popen(["osascript", "-e",
+            f'display notification "Screenshots & URLs werden aufgezeichnet. '
+            f'\u2325 Taste = Sprachnotiz anheften." '
+            f'with title "whispr \U0001f9ea Testing l\u00e4uft: {name}"'])
+
+    def stop_test_cb(self, _):
+        self._item_test_stop.title  = ""
+        self._item_test_start.title = "🧪 Testing starten"
+        self._test_running          = False
+        stop_test_session()
+
     def quit_app(self, _):
         if stream is not None:
             stream.stop()
             stream.close()
+        if meeting_stream is not None:
+            meeting_stream.stop()
+            meeting_stream.close()
         rumps.quit_application()
 
     def on_press(self, key):
