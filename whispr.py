@@ -91,17 +91,20 @@ NOTION_TOKEN      = os.environ.get("NOTION_TOKEN", "")    # Notion Internal Inte
 
 # Notion: Parent-Page für alle Test-Reports (Testing & Feedback unter Product)
 NOTION_TESTING_PAGE_ID = "33ea32b52b49817ab561fc6d88dd991b"
+NOTION_BUG_DB_ID       = "7aaad96c65ac48b6a949bf99adea5e72"  # Bug & Feedback Tracker v2
+MADELEINE_NOTION_ID    = "0cd9e3be-e325-495b-90ee-e7bb73694782"
 
 # Bekannte Call-Apps → Typ (external / internal)
 CALL_APPS = {
     "zoom.us":           "external",
     "Zoom":              "external",
-    "Google Chrome":     "external",   # Google Meet läuft im Browser
     "Microsoft Teams":   "external",
     "Webex":             "external",
     "FaceTime":          "external",
     "Slack":             "internal",
 }
+# Browser-URLs die als Call gelten
+CALL_URLS = ["meet.google.com", "app.gather.town", "whereby.com", "teams.microsoft.com/meet"]
 # ──────────────────────────────────────────────────────────
 
 # Hotkey für Aufnahme — rechte Option-Taste (fn funktioniert nicht auf neueren Macs)
@@ -204,7 +207,7 @@ meeting_lock    = threading.Lock()
 
 # ─── Call Detection ───────────────────────────────────────
 def get_active_call_app():
-    """Prüft ob eine bekannte Call-App läuft. Gibt (app_name, call_type) zurück."""
+    """Prüft ob ein aktiver Call läuft. Gibt (app_name, call_type) zurück."""
     try:
         r = subprocess.run(
             ["osascript", "-e",
@@ -212,9 +215,22 @@ def get_active_call_app():
             capture_output=True, text=True, timeout=2
         )
         procs = r.stdout
+
+        # Zoom/Teams/Webex/FaceTime: Prozess läuft = Call aktiv
+        # Slack absichtlich ausgeschlossen — zu viele False Positives
+        # (Slack-Calls manuell über Menü aufnehmen)
         for app, ctype in CALL_APPS.items():
+            if app == "Slack":
+                continue
             if app in procs:
                 return app, ctype
+
+        # Chrome: nur wenn Meet/Call-URL aktiv
+        if "Google Chrome" in procs:
+            url = get_chrome_url()
+            if url and any(c in url for c in CALL_URLS):
+                return "Google Chrome", "external"
+
     except Exception:
         pass
     return None, None
@@ -378,10 +394,15 @@ def get_chrome_url() -> str:
 def _take_screenshot(path: str) -> bool:
     """Macht einen Screenshot des gesamten Bildschirms."""
     try:
-        subprocess.run(["screencapture", "-x", "-o", path],
-                       capture_output=True, check=True, timeout=5)
-        return os.path.exists(path)
-    except Exception:
+        r = subprocess.run(["screencapture", "-x", "-o", path],
+                           capture_output=True, timeout=5)
+        if r.returncode != 0 or not os.path.exists(path):
+            # Wahrscheinlich fehlende Screen Recording Permission
+            print(f"[whispr] screencapture fehlgeschlagen: {r.stderr.decode()[:100]}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[whispr] Screenshot-Fehler: {e}")
         return False
 
 def _images_differ(path1: str, path2: str, threshold: float = 0.025) -> bool:
@@ -437,9 +458,14 @@ def start_test_session(name: str):
 
 def stop_test_session(app_ref=None):
     global test_active
+    if not test_active:
+        return  # nichts zu stoppen
     test_active = False
-    if _test_thread:
-        _test_thread.join(timeout=3)
+    try:
+        if _test_thread and _test_thread.is_alive():
+            _test_thread.join(timeout=3)
+    except Exception:
+        pass
 
     with test_lock:
         shots    = list(test_screenshots)
@@ -503,10 +529,32 @@ def _process_and_export_test(name: str, shots: list, duration: float):
 
         notion_url = _create_notion_test_report(name, analysed, duration, len(shots))
 
-        if notion_url:
-            n_fb = len([x for x in analysed if x["has_notes"]])
+        # Bug-Reports für jeden Screen mit Voice-Notes → direkt in Notion-Datenbank
+        bug_count = 0
+        for s in shots:
+            if s.get("notes"):
+                ok = _create_bug_report_entry(s["notes"], s.get("url", ""), name)
+                if ok:
+                    bug_count += 1
+
+        # meta.json für Dashboard speichern
+        import json as _json
+        session_dir = _test_dir_for_session(name)
+        meta = {
+            "name": name,
+            "screenshots": len(shots),
+            "duration": duration,
+            "notion_url": notion_url or "",
+            "bug_reports": bug_count,
+            "created_at": datetime.now().isoformat()
+        }
+        with open(os.path.join(session_dir, "meta.json"), "w") as f:
+            _json.dump(meta, f)
+
+        if notion_url or bug_count:
+            n_fb = len([s for s in shots if s.get("notes")])
             subprocess.Popen(["osascript", "-e",
-                f'display notification "Notion-Report fertig \u2014 {n_fb} Screens mit Feedback" '
+                f'display notification "Notion fertig \u2014 {n_fb} Bug-Reports erstellt" '
                 f'with title "whispr \u2705 Test abgeschlossen"'])
         else:
             subprocess.Popen(["osascript", "-e",
@@ -611,6 +659,73 @@ def _create_notion_test_report(name: str, shots: list, duration: float, total_sc
     if r.status_code == 200:
         return r.json().get("url")
     return None
+
+# ─── Bug Report → Notion Datenbank ──────────────────────
+def _infer_area_from_url(url: str) -> str:
+    """Leitet Area-Option aus der URL ab."""
+    if not url:
+        return "Other"
+    url = url.lower()
+    if "onboarding"  in url: return "Onboarding"
+    if "questionnaire" in url or "fragebogen" in url: return "Questionnaire"
+    if "notarization" in url or "notar" in url: return "Notarization"
+    if "banking" in url or "konto" in url: return "Banking"
+    if "document" in url or "vertrag" in url: return "Documents"
+    if "support" in url or "chat" in url: return "Support Chat"
+    if "dashboard" in url: return "Dashboard"
+    if "payment" in url or "zahlung" in url or "checkout" in url: return "Payments"
+    return "Other"
+
+def _create_bug_report_entry(voice_notes: list, url: str, session_name: str) -> bool:
+    """Erstellt einen Bug-Report-Eintrag in der Notion-Datenbank."""
+    if not NOTION_TOKEN or not _REQUESTS:
+        return False
+    try:
+        full_note = " / ".join(voice_notes)
+        # Titel = erste 80 Zeichen der Notiz
+        title = full_note[:80] + ("…" if len(full_note) > 80 else "")
+        area  = _infer_area_from_url(url)
+        steps = f"URL: {url}" if url else "Keine URL erfasst"
+        steps += f"\\nTest-Session: {session_name}"
+
+        headers = {
+            "Authorization":  f"Bearer {NOTION_TOKEN}",
+            "Notion-Version": "2022-06-28",
+            "Content-Type":   "application/json",
+        }
+        payload = {
+            "parent": {"database_id": NOTION_BUG_DB_ID},
+            "properties": {
+                "Title": {
+                    "title": [{"type": "text", "text": {"content": title}}]
+                },
+                "Actual Behavior": {
+                    "rich_text": [{"type": "text", "text": {"content": full_note[:2000]}}]
+                },
+                "Steps to Reproduce": {
+                    "rich_text": [{"type": "text", "text": {"content": steps[:2000]}}]
+                },
+                "Area": {
+                    "select": {"name": area}
+                },
+                "Status": {
+                    "select": {"name": "📥 New"}
+                },
+                "Type": {
+                    "select": {"name": "🐛 Bug"}
+                },
+                "Reported By": {
+                    "people": [{"id": MADELEINE_NOTION_ID}]
+                },
+            }
+        }
+        r = _requests_lib.post(
+            "https://api.notion.com/v1/pages",
+            headers=headers, json=payload, timeout=10
+        )
+        return r.status_code == 200
+    except Exception:
+        return False
 
 # ─── Meeting Summary (Claude API) ────────────────────────
 def _generate_meeting_summary(transcript, call_type, app):
@@ -827,6 +942,7 @@ class RecordingOverlay:
         self._smooth      = 0.0
         self._dirty       = False
         self._visible     = False
+        self._shown_at    = None   # Zeitstempel wann overlay gezeigt wurde
 
         if not _APPKIT:
             return
@@ -896,6 +1012,12 @@ class RecordingOverlay:
         """50-ms-Tick auf dem Main-Thread — aktualisiert das Panel."""
         if not self._panel:
             return
+        # Safety: Overlay nach 45s automatisch ausblenden
+        with self._lock:
+            if self._visible and self._shown_at and (time.monotonic() - self._shown_at) > 45:
+                self._cmd      = "hide"
+                self._shown_at = None
+                self._dirty    = True
         with self._lock:
             if not self._dirty:
                 # Level-Balken auch ohne dirty-Flag glätten
@@ -945,6 +1067,7 @@ class RecordingOverlay:
     def show(self, app_name: str = "", lang: str = "de"):
         with self._lock:
             self._cmd, self._app_name, self._lang = "show", app_name, lang
+            self._shown_at = time.monotonic()
             self._dirty = True
 
     def set_transcribing(self, lang: str = "de"):
@@ -954,8 +1077,9 @@ class RecordingOverlay:
 
     def hide(self):
         with self._lock:
-            self._cmd   = "hide"
-            self._dirty = True
+            self._cmd      = "hide"
+            self._shown_at = None
+            self._dirty    = True
 
     def update_level(self, raw_rms: float):
         with self._lock:
@@ -1111,6 +1235,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="nav-item" onclick="nav('meetings')">
     <span class="nav-icon">📋</span> <span id="nav-meetings">Meetings</span>
   </div>
+  <div class="nav-item" onclick="nav('testing')">
+    <span class="nav-icon">🧪</span> Testing
+  </div>
   <div class="nav-item" onclick="nav('settings')">
     <span class="nav-icon">⚙️</span> <span id="nav-settings">Einstellungen</span>
   </div>
@@ -1256,6 +1383,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <p id="set-p-clear">Löscht alle gespeicherten Diktate. Wörter & WPM-Statistiken werden zurückgesetzt.</p>
       <button class="btn-danger" id="btn-clear" onclick="clearHistory()">🗑 Verlauf löschen</button>
     </div>
+  </div>
+
+  <!-- Testing -->
+  <div class="page" id="page-testing">
+    <h1>🧪 Testing</h1>
+    <div style="margin-bottom:20px;display:flex;gap:10px;align-items:center">
+      <button onclick="startTest()" id="btn-test-start" style="background:#1d1d1f;color:#fff;border:none;padding:10px 20px;border-radius:8px;font-size:14px;cursor:pointer">▶ Test starten</button>
+      <button onclick="stopTest()" id="btn-test-stop" style="background:#ff3b30;color:#fff;border:none;padding:10px 20px;border-radius:8px;font-size:14px;cursor:pointer;display:none">⏹ Test stoppen & Notion-Report</button>
+      <span id="test-status" style="font-size:13px;color:#666"></span>
+    </div>
+    <div id="test-session-list"><div class="empty">Noch keine Test-Sessions.</div></div>
   </div>
 
 </div>
@@ -1437,6 +1575,7 @@ function nav(name) {
   if (name === 'snippets')   loadSnippets();
   if (name === 'meetings')   loadMeetings();
   if (name === 'settings')   loadSettings();
+  if (name === 'testing')    loadTesting();
 }
 
 function esc(s) {
@@ -1586,7 +1725,7 @@ async function loadMeetings() {
     const icon  = m.call_type === 'internal' ? '👥' : '📞';
     const label = m.call_type === 'internal' ? 'Team-Call' : 'Externer Call';
     const dur   = m.duration ? Math.round(m.duration/60)+'min' : '';
-    const preview = (m.summary || '').slice(0,120).replace(/\n/g,' ');
+    const preview = (m.summary || '').slice(0,120).split('\\n').join(' ');
     return `<div class="history-item" style="cursor:pointer" onclick="openMeeting(${m.id})">
       <div class="history-time">${time}<br><small>${day}</small></div>
       <div style="flex:1">
@@ -1638,6 +1777,49 @@ document.addEventListener('visibilitychange', () => {
   else startPolling();
 });
 checkLang().then(() => { startPolling(); loadHome(); });
+
+// ── Testing ──────────────────────────────────────────────
+async function loadTesting() {
+  const status = await fetch('/api/test/status').then(r=>r.json()).catch(()=>({active:false}));
+  const start = document.getElementById('btn-test-start');
+  const stop  = document.getElementById('btn-test-stop');
+  const stat  = document.getElementById('test-status');
+  if (status.active) {
+    start.style.display = 'none';
+    stop.style.display  = 'inline-block';
+    stat.textContent    = 'Läuft: ' + (status.name || '') + ' …';
+  } else {
+    start.style.display = 'inline-block';
+    stop.style.display  = 'none';
+    stat.textContent    = '';
+  }
+  const sessions = await fetch('/api/test/sessions').then(r=>r.json()).catch(()=>[]);
+  const el = document.getElementById('test-session-list');
+  if (!sessions.length) { el.innerHTML = '<div class="empty">Noch keine Test-Sessions.</div>'; return; }
+  el.innerHTML = sessions.map(s => {
+    const dt  = new Date(s.created_at);
+    const day = dt.toLocaleDateString('de',{day:'2-digit',month:'short',year:'numeric'});
+    const tim = dt.toLocaleTimeString('de',{hour:'2-digit',minute:'2-digit'});
+    return '<div class="history-item"><div class="history-time">'+tim+'<br><small>'+day+'</small></div>'
+      +'<div style="flex:1"><div style="font-weight:600;font-size:13px;margin-bottom:4px">'+esc(s.name)+'</div>'
+      +'<div class="history-text">'+s.screenshots+' Screenshots · '+Math.round(s.duration/60)+' min'
+      +(s.notion_url ? ' · <a href="'+s.notion_url+'" target="_blank" style="color:#007aff">Notion Report</a>' : '')
+      +'</div></div></div>';
+  }).join('');
+}
+
+async function startTest() {
+  const name = prompt('Test-Session Name:', 'GmbH Flow v1');
+  if (!name) return;
+  await fetch('/api/test/start', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name})});
+  loadTesting();
+}
+
+async function stopTest() {
+  document.getElementById('test-status').textContent = 'Erstelle Notion-Report …';
+  await fetch('/api/test/stop', {method:'POST'});
+  setTimeout(loadTesting, 2000);
+}
 </script>
 </body>
 </html>"""
@@ -1806,6 +1988,37 @@ def api_meeting_detail(mid):
 def api_meeting_status():
     return jsonify(active=meeting_active, app=meeting_app, call_type=meeting_type)
 
+@flask_app.route("/api/test/status")
+def api_test_status():
+    return jsonify(active=test_active, name=test_session_name)
+
+@flask_app.route("/api/test/start", methods=["POST"])
+def api_test_start():
+    data = request.get_json(silent=True) or {}
+    name = data.get("name", "Test")
+    start_test_session(name)
+    return jsonify(ok=True)
+
+@flask_app.route("/api/test/stop", methods=["POST"])
+def api_test_stop():
+    threading.Thread(target=stop_test_session, daemon=True).start()
+    return jsonify(ok=True)
+
+@flask_app.route("/api/test/sessions")
+def api_test_sessions():
+    try:
+        import glob, json as _json
+        base = os.path.expanduser("~/.whispr-tests")
+        sessions = []
+        for d in sorted(glob.glob(os.path.join(base, "*")), reverse=True)[:20]:
+            meta_path = os.path.join(d, "meta.json")
+            if os.path.exists(meta_path):
+                with open(meta_path) as f:
+                    sessions.append(_json.load(f))
+        return jsonify(sessions)
+    except Exception:
+        return jsonify([])
+
 def run_flask():
     import logging
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
@@ -1848,11 +2061,12 @@ class WhisprApp(rumps.App):
         self._item_paste         = rumps.MenuItem("Letzten Text einfügen", callback=self.paste_last)
         self._item_lang          = rumps.MenuItem("",                      callback=self.toggle_language)
         self._item_mode          = rumps.MenuItem("",                      callback=self.toggle_mode_cb)
-        self._item_meeting_start = rumps.MenuItem("",                      callback=self.start_meeting_cb)
-        self._item_meeting_stop  = rumps.MenuItem("",                      callback=self.stop_meeting_cb)
-        self._item_test_start    = rumps.MenuItem("🧪 Testing starten",   callback=self.start_test_cb)
-        self._item_test_stop     = rumps.MenuItem("",                      callback=self.stop_test_cb)
-        self._item_quit          = rumps.MenuItem("Beenden",               callback=self.quit_app)
+        self._item_meeting_start  = rumps.MenuItem("",                         callback=self.start_meeting_cb)
+        self._item_meeting_stop   = rumps.MenuItem("",                         callback=self.stop_meeting_cb)
+        self._item_meeting_manual = rumps.MenuItem("🎙 Meeting aufnehmen",    callback=self.start_manual_meeting_cb)
+        self._item_test_start     = rumps.MenuItem("🧪 Test starten",         callback=self.start_test_cb)
+        self._item_test_stop      = rumps.MenuItem("",                         callback=self.stop_test_cb)
+        self._item_quit           = rumps.MenuItem("Beenden",                  callback=self.quit_app)
         self._item_meeting_start.set_callback(self.start_meeting_cb)
         self._item_meeting_stop.set_callback(self.stop_meeting_cb)
         self._item_test_stop.set_callback(self.stop_test_cb)
@@ -1862,7 +2076,7 @@ class WhisprApp(rumps.App):
             rumps.separator,
             self._item_test_start,
             self._item_test_stop,
-            rumps.separator,
+            self._item_meeting_manual,
             self._item_meeting_start,
             self._item_meeting_stop,
             rumps.separator,
@@ -1923,6 +2137,19 @@ class WhisprApp(rumps.App):
             self._item_meeting_start.title = ""
             self._item_meeting_stop.title  = ""
 
+    def start_manual_meeting_cb(self, _):
+        """Manuell eine Meeting-Aufnahme starten — ohne Auto-Detection."""
+        if meeting_active:
+            return
+        self._call_detected_app  = "Manuell"
+        self._call_detected_type = "internal"
+        start_meeting_recording("Manuell", "internal")
+        self._item_meeting_manual.title = ""
+        self._item_meeting_stop.title   = "⏹ Meeting stoppen & zusammenfassen"
+        subprocess.Popen(["osascript", "-e",
+            'display notification "Aufnahme l\u00e4uft \u2014 stoppe sie \u00fcber das Men\u00fc" '
+            'with title "whispr \U0001f534 Meeting l\u00e4uft"'])
+
     def start_meeting_cb(self, _):
         if not self._call_detected_app:
             return
@@ -1935,9 +2162,10 @@ class WhisprApp(rumps.App):
             'with title "whispr \U0001f534 Meeting läuft"'])
 
     def stop_meeting_cb(self, _):
-        self._item_meeting_start.title = ""
-        self._item_meeting_stop.title  = ""
-        self._call_detected_app        = None
+        self._item_meeting_start.title  = ""
+        self._item_meeting_stop.title   = ""
+        self._item_meeting_manual.title = "🎙 Meeting aufnehmen"
+        self._call_detected_app         = None
         threading.Thread(target=stop_and_process_meeting, daemon=True).start()
 
     def start_test_cb(self, _):
@@ -1992,7 +2220,15 @@ class WhisprApp(rumps.App):
                 fn_pressed = True
                 self.title = "🔴"
                 overlay.show(app_name, LANGUAGE)
-                start_recording()
+                try:
+                    start_recording()
+                except Exception as e:
+                    print(f"[whispr] Mikrofon-Fehler: {e}")
+                    overlay.hide()
+                    fn_pressed = False
+                    self.title = "🎙"
+                    subprocess.Popen(["osascript", "-e",
+                        'display notification "Mikrofon nicht verfügbar – bitte prüfen" with title "whispr ⚠️"'])
             else:
                 fn_pressed = False
                 self.title = "⏳"
@@ -2004,7 +2240,15 @@ class WhisprApp(rumps.App):
                 fn_pressed = True
                 self.title = "🔴"
                 overlay.show(app_name, LANGUAGE)
-                start_recording()
+                try:
+                    start_recording()
+                except Exception as e:
+                    print(f"[whispr] Mikrofon-Fehler: {e}")
+                    overlay.hide()
+                    fn_pressed = False
+                    self.title = "🎙"
+                    subprocess.Popen(["osascript", "-e",
+                        'display notification "Mikrofon nicht verfügbar – bitte prüfen" with title "whispr ⚠️"'])
 
     def on_release(self, key):
         global fn_pressed
