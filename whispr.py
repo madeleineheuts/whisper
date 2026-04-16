@@ -79,7 +79,7 @@ except Exception:
 # ─── Config ───────────────────────────────────────────────
 SAMPLE_RATE = 16000
 MODEL_SIZE  = "small"   # tiny | small | medium
-LANGUAGE    = "de"      # "de" | "en" | "auto"
+LANGUAGE    = "de"      # "de" | "en"
 VAD_FILTER  = True      # Voice Activity Detection (Stille rausfiltern)
 PORT        = 5173
 DB_PATH     = os.path.expanduser("~/.whispr.db")
@@ -170,8 +170,11 @@ init_db()
 def _load_settings():
     global LANGUAGE, VAD_FILTER
     lang = get_setting("language", LANGUAGE)
-    if lang in ("de", "en", "auto"):
+    if lang in ("de", "en"):  # "auto" nicht mehr unterstützt → default de
         LANGUAGE = lang
+    elif lang == "auto":
+        LANGUAGE = "de"
+        set_setting("language", "de")
     vad = get_setting("vad_filter", "1")
     VAD_FILTER = vad == "1"
 
@@ -2089,12 +2092,22 @@ class WhisprApp(rumps.App):
         self._item_meeting_stop.title  = ""
         self._item_test_stop.title     = ""
         self._refresh_labels()
+        self._refresh_test_menu()
 
     def _refresh_labels(self):
         """Nur die Labels aktualisieren — kein Menü-Rebuild."""
-        lang_icons = {"de": "🇩🇪 DE", "en": "🇬🇧 EN", "auto": "🌐 Auto"}
+        lang_icons = {"de": "🇩🇪 Deutsch", "en": "🇬🇧 English"}
         self._item_lang.title = f"Sprache: {lang_icons.get(LANGUAGE, LANGUAGE)} (wechseln)"
         self._item_mode.title = f"Modus: {'🔁 Toggle' if toggle_mode else '⏺ Halten'} (wechseln)"
+
+    def _refresh_test_menu(self):
+        """Test starten/stoppen Items wechseln sich ab."""
+        if test_active:
+            self._item_test_start.title = ""
+            self._item_test_stop.title  = "🛑 Test beenden"
+        else:
+            self._item_test_start.title = "🧪 Test starten"
+            self._item_test_stop.title  = ""
 
     def open_dashboard(self, _):
         subprocess.Popen(["open", f"http://localhost:{PORT}"])
@@ -2109,7 +2122,7 @@ class WhisprApp(rumps.App):
 
     def toggle_language(self, _):
         global LANGUAGE
-        cycle = {"de": "en", "en": "auto", "auto": "de"}
+        cycle = {"de": "en", "en": "de"}
         LANGUAGE = cycle.get(LANGUAGE, "de")
         set_setting("language", LANGUAGE)
         self._refresh_labels()
@@ -2181,19 +2194,17 @@ class WhisprApp(rumps.App):
         if not name or response.returncode != 0:
             return
         self._test_running           = True
-        self._item_test_start.title  = ""
-        self._item_test_stop.title   = f"⏹ Testing stoppen & Notion-Report → \"{name}\""
         start_test_session(name)
+        self._refresh_test_menu()
         subprocess.Popen(["osascript", "-e",
             f'display notification "Screenshots & URLs werden aufgezeichnet. '
             f'\u2325 Taste = Sprachnotiz anheften." '
             f'with title "whispr \U0001f9ea Testing l\u00e4uft: {name}"'])
 
     def stop_test_cb(self, _):
-        self._item_test_stop.title  = ""
-        self._item_test_start.title = "🧪 Testing starten"
-        self._test_running          = False
+        self._test_running = False
         stop_test_session()
+        self._refresh_test_menu()
 
     def quit_app(self, _):
         if stream is not None:
