@@ -374,6 +374,7 @@ test_screenshots         = []   # list of {path, url, timestamp, notes:[]}
 test_last_path           = None
 test_lock                = threading.Lock()
 _test_thread             = None
+_test_session_dir        = None   # Fix: session_dir einmalig speichern
 
 def _test_dir_for_session(name):
     safe = "".join(c if c.isalnum() or c in " -_" else "_" for c in name)
@@ -426,7 +427,7 @@ def _test_screenshot_loop(session_dir: str):
     idx = 0
     while test_active:
         try:
-            tmp = os.path.join(session_dir, f"_tmp.png")
+            tmp = os.path.join(session_dir, f"_tmp_{int(time.monotonic()*1000)}.png")
             if _take_screenshot(tmp):
                 if test_last_path is None or _images_differ(test_last_path, tmp):
                     url        = get_chrome_url()
@@ -448,9 +449,54 @@ def _test_screenshot_loop(session_dir: str):
             pass
         time.sleep(1.5)
 
+def _capture_note_anchor_screenshot():
+    """Sofortiger Screenshot wenn Sprachnotiz beginnt — damit Notiz am richtigen Screen hängt."""
+    global test_last_path
+    if not _test_session_dir or not test_active:
+        return
+    try:
+        ts    = datetime.now()
+        path  = os.path.join(_test_session_dir, f"note_{ts.strftime('%H%M%S_%f')}.png")
+        if _take_screenshot(path):
+            url = get_chrome_url()
+            with test_lock:
+                # Nur hinzufügen wenn wirklich anderer Screen
+                if test_last_path is None or _images_differ(test_last_path, path):
+                    test_screenshots.append({
+                        "path":        path,
+                        "url":         url,
+                        "timestamp":   ts.isoformat(),
+                        "notes":       [],
+                        "_note_anchor": True,  # Markierung: diese Notiz gehört hierhin
+                    })
+                    test_last_path = path
+                else:
+                    # Selber Screen — nur als Anchor an letzten Screenshot markieren
+                    if test_screenshots:
+                        test_screenshots[-1]["_note_anchor"] = True
+                    if os.path.exists(path):
+                        os.unlink(path)
+    except Exception as e:
+        print(f"[whispr] Note-Anchor-Screenshot fehlgeschlagen: {e}")
+
 def start_test_session(name: str):
-    global test_active, test_session_name, test_start_time, test_screenshots, test_last_path, _test_thread
+    global test_active, test_session_name, test_start_time, test_screenshots, test_last_path, _test_thread, _test_session_dir
+
+    # Screen Recording Permission prüfen
+    test_img = os.path.expanduser("~/.whispr-tests/_permission_check.png")
+    os.makedirs(os.path.expanduser("~/.whispr-tests"), exist_ok=True)
+    r = subprocess.run(["screencapture", "-x", "-o", test_img], capture_output=True, timeout=5)
+    if r.returncode != 0 or not os.path.exists(test_img):
+        subprocess.Popen(["osascript", "-e",
+            'display alert "whispr: Bildschirmaufnahme fehlt" message '
+            '"Bitte erlaube Bildschirmaufnahme unter:\\n'
+            'Systemeinstellungen → Datenschutz → Bildschirmaufnahme → Terminal" '
+            'buttons {"OK"}'])
+        return
+    os.unlink(test_img)
+
     session_dir           = _test_dir_for_session(name)
+    _test_session_dir     = session_dir   # Fix: einmalig merken
     test_active           = True
     test_session_name     = name
     test_start_time       = datetime.now()
@@ -540,9 +586,9 @@ def _process_and_export_test(name: str, shots: list, duration: float):
                 if ok:
                     bug_count += 1
 
-        # meta.json für Dashboard speichern
+        # meta.json für Dashboard speichern (in das RICHTIGE Verzeichnis)
         import json as _json
-        session_dir = _test_dir_for_session(name)
+        session_dir = _test_session_dir or _test_dir_for_session(name)
         meta = {
             "name": name,
             "screenshots": len(shots),
@@ -648,20 +694,36 @@ def _create_notion_test_report(name: str, shots: list, duration: float, total_sc
                                 "annotations": {"color": "gray"}}
                            ]}})
 
-    # Seite erstellen
+    # Seite erstellen (Notion: max 100 Blocks beim Create)
     payload = {
         "parent":     {"page_id": NOTION_TESTING_PAGE_ID},
         "icon":       {"type": "emoji", "emoji": "\U0001f9ea"},
         "properties": {"title": {"title": [{"type": "text", "text":
             {"content": f"\U0001f9ea {name} — {date_str}"}
         }]}},
-        "children": blocks[:100]   # Notion API: max 100 blocks per request
+        "children": blocks[:100]
     }
 
     r = _requests.post("https://api.notion.com/v1/pages", headers=headers, json=payload, timeout=15)
-    if r.status_code == 200:
-        return r.json().get("url")
-    return None
+    if r.status_code != 200:
+        return None
+
+    page_id   = r.json().get("id")
+    page_url  = r.json().get("url")
+
+    # Restliche Blocks in Chunks anhängen
+    remaining = blocks[100:]
+    chunk_size = 100
+    for i in range(0, len(remaining), chunk_size):
+        chunk = remaining[i:i + chunk_size]
+        _requests.patch(
+            f"https://api.notion.com/v1/blocks/{page_id}/children",
+            headers=headers,
+            json={"children": chunk},
+            timeout=15
+        )
+
+    return page_url
 
 # ─── Bug Report → Notion Datenbank ──────────────────────
 def _infer_area_from_url(url: str) -> str:
@@ -688,8 +750,7 @@ def _create_bug_report_entry(voice_notes: list, url: str, session_name: str) -> 
         # Titel = erste 80 Zeichen der Notiz
         title = full_note[:80] + ("…" if len(full_note) > 80 else "")
         area  = _infer_area_from_url(url)
-        steps = f"URL: {url}" if url else "Keine URL erfasst"
-        steps += f"\\nTest-Session: {session_name}"
+        steps = f"URL: {url}\nTest-Session: {session_name}" if url else f"Test-Session: {session_name}"
 
         headers = {
             "Authorization":  f"Bearer {NOTION_TOKEN}",
@@ -722,7 +783,7 @@ def _create_bug_report_entry(voice_notes: list, url: str, session_name: str) -> 
                 },
             }
         }
-        r = _requests_lib.post(
+        r = _requests.post(
             "https://api.notion.com/v1/pages",
             headers=headers, json=payload, timeout=10
         )
@@ -851,7 +912,16 @@ def stop_and_transcribe(app_ref):
             if test_active:
                 with test_lock:
                     if test_screenshots:
-                        test_screenshots[-1]["notes"].append(text)
+                        # Notiz dem Screenshot mit dem nächsten Timestamp anhängen
+                        # (wurde beim Drücken von fn bereits aufgenommen — s. _attach_test_note_shot)
+                        # Falls kein separater Screenshot: letzten nehmen
+                        target = next(
+                            (s for s in reversed(test_screenshots) if s.get("_note_anchor")),
+                            test_screenshots[-1]
+                        )
+                        target["notes"].append(text)
+                        # _note_anchor Flag zurücksetzen
+                        target["_note_anchor"] = False
 
             subprocess.run(["pbcopy"], input=text.encode("utf-8"))
             subprocess.run([
@@ -1846,9 +1916,16 @@ def api_stats():
     streak = 0
     today  = date.today()
     for i, row in enumerate(rows):
-        d = datetime.strptime(row["day"], "%Y-%m-%d").date()
-        if (today - d).days == i: streak += 1
-        else: break
+        try:
+            d = datetime.strptime(row["day"], "%Y-%m-%d").date()
+        except Exception:
+            break
+        # i==0: heute (0 Tage) ODER gestern (1 Tag) zählt als Streak-Start
+        expected = i if (rows and datetime.strptime(rows[0]["day"], "%Y-%m-%d").date() == today) else i + 1
+        if (today - d).days == expected:
+            streak += 1
+        else:
+            break
     return jsonify(total_words=total_words, avg_wpm=int(avg_wpm), streak=streak)
 
 @flask_app.route("/api/history")
@@ -2193,16 +2270,21 @@ class WhisprApp(rumps.App):
         name = response.stdout.strip()
         if not name or response.returncode != 0:
             return
-        self._test_running           = True
+        self._test_running = True
         start_test_session(name)
-        self._refresh_test_menu()
-        subprocess.Popen(["osascript", "-e",
-            f'display notification "Screenshots & URLs werden aufgezeichnet. '
-            f'\u2325 Taste = Sprachnotiz anheften." '
-            f'with title "whispr \U0001f9ea Testing l\u00e4uft: {name}"'])
+        if test_active:   # start_test_session setzt test_active nur wenn Permission OK
+            self.title = "🧪"
+            self._refresh_test_menu()
+            subprocess.Popen(["osascript", "-e",
+                f'display notification "Screenshots & URLs werden aufgezeichnet. '
+                f'fn-Taste = Sprachnotiz anheften." '
+                f'with title "whispr 🧪 Testing läuft: {name}"'])
+        else:
+            self._test_running = False
 
     def stop_test_cb(self, _):
         self._test_running = False
+        self.title = "🎙"
         stop_test_session()
         self._refresh_test_menu()
 
@@ -2231,6 +2313,8 @@ class WhisprApp(rumps.App):
                 fn_pressed = True
                 self.title = "🔴"
                 overlay.show(app_name, LANGUAGE)
+                if test_active:
+                    threading.Thread(target=_capture_note_anchor_screenshot, daemon=True).start()
                 try:
                     start_recording()
                 except Exception as e:
@@ -2251,6 +2335,8 @@ class WhisprApp(rumps.App):
                 fn_pressed = True
                 self.title = "🔴"
                 overlay.show(app_name, LANGUAGE)
+                if test_active:
+                    threading.Thread(target=_capture_note_anchor_screenshot, daemon=True).start()
                 try:
                     start_recording()
                 except Exception as e:
